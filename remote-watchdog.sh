@@ -72,9 +72,11 @@ while IFS= read -r line; do
   pane_id=$(echo "$line" | cut -d'|' -f1)
   win_name=$(echo "$line" | cut -d'|' -f2)
 
-  # Capture the last 5 visible lines (status bar area). Using tail on the
-  # full capture instead of -S flag, which counts from scrollback start.
-  pane_content=$(tmux capture-pane -t "$pane_id" -p 2>/dev/null | tail -5 || true)
+  # Grab the LAST line in the pane that mentions "Remote Control" — that is
+  # the status bar. Earlier occurrences ("⎿ Remote Control connecting…") are
+  # scrollback from prior /remote-control invocations and would cause false
+  # WARN/DEAD readings if matched.
+  pane_content=$(tmux capture-pane -t "$pane_id" -p 2>/dev/null | grep "Remote Control" | tail -1 || true)
 
   # Skip panes without Remote Control in the status bar
   if ! echo "$pane_content" | grep -q "Remote Control"; then
