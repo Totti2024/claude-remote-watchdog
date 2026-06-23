@@ -55,6 +55,27 @@ LOGIN_RE='Please run /login|401 Invalid authentication|token has expired'
 # Markers that prove a live Claude Code TUI is present (vs a crashed shell).
 CLAUDE_BAR_RE='bypass permissions|for agents|\? for shortcuts|esc to interrupt|/effort|/rc '
 
+# --- Notification (added 2026-06-23) ----------------------------------------
+# Bei einem harten 401 kann der Watchdog NICHT selbst heilen (nur der Mensch via
+# /login). Damit Totti nicht erst beim nächsten Blick aufs Handy merkt, dass RC
+# down ist, schicken wir EINMALIG pro 401-Episode eine Telegram-Warnung über den
+# n8n-Webhook (URL in ~/.config/claude-rc-watchdog/notify.env, nicht im Repo).
+NOTIFY_CFG="$HOME/.config/claude-rc-watchdog/notify.env"
+[ -f "$NOTIFY_CFG" ] && . "$NOTIFY_CFG"
+notify_totti() {
+  local msg="$1"
+  if $DRY_RUN; then echo "[DRY-RUN] Would notify Totti: $msg"; return 0; fi
+  # Lokale Desktop-Meldung (greift, wenn jemand am Mac sitzt).
+  osascript -e "display notification \"$msg\" with title \"RC-Watchdog\"" >/dev/null 2>&1 || true
+  # Push aufs Handy via n8n-Webhook (greift auch unterwegs).
+  if [ -n "${RC_NOTIFY_WEBHOOK:-}" ]; then
+    curl -sS -m 15 -o /dev/null -X POST -H 'Content-Type: application/json' \
+      --data "{\"message\":\"$msg\"}" "$RC_NOTIFY_WEBHOOK" >/dev/null 2>&1 \
+      && echo "[NOTIFY] Telegram-Alert gesendet" \
+      || echo "[NOTIFY] Webhook-Push fehlgeschlagen"
+  fi
+}
+
 # --- Whole-server resurrection (added 2026-06-23) ---------------------------
 # The classification logic above only repairs RC *inside* existing sessions.
 # It is blind to the catastrophic case where the whole tmux server crashes
@@ -178,6 +199,7 @@ while IFS= read -r line; do
 
   pane_full=$(tmux capture-pane -t "$pane_id" -p 2>/dev/null || true)
   state_file="/tmp/claude-remote-watchdog-${pane_id//[^a-zA-Z0-9]/_}.fail"
+  notify_file="/tmp/claude-remote-watchdog-${pane_id//[^a-zA-Z0-9]/_}.notified"
 
   # Last RC-indicator line = the status bar (earlier matches are scrollback).
   rc_line=$(echo "$pane_full" | grep -iE -- "$RC_TOKEN_RE" | tail -1 || true)
@@ -201,7 +223,9 @@ while IFS= read -r line; do
   # ---------- HEALTHY: live Claude TUI, no failure signal ----------
   elif echo "$pane_full" | grep -qiE -- "$CLAUDE_BAR_RE"; then
     FOUND_ANY=true
-    $DRY_RUN || rm -f "$state_file" 2>/dev/null
+    # Wieder gesund -> Grace- UND Notify-Marker löschen (re-arm: ein späterer
+    # 401 löst dann wieder eine frische Telegram-Warnung aus).
+    $DRY_RUN || rm -f "$state_file" "$notify_file" 2>/dev/null
     echo "[HEALTHY] $sess_name ($pane_id)"
     continue
   # ---------- SKIP: no Claude bar (crashed shell, or a menu/overlay is open) ----------
@@ -219,6 +243,13 @@ while IFS= read -r line; do
       cycle_remote_control "$pane_id" "$sess_name"
     else
       reconnect_dead_rc "$pane_id" "$sess_name"
+      # Harter 401: der Watchdog kann NICHT selbst heilen (nur /login durch
+      # Totti). EINMALIG pro Episode warnen (Marker verhindert 5-Min-Spam;
+      # wird bei [HEALTHY] wieder entfernt).
+      if echo "$pane_full" | grep -qiE -- "$LOGIN_RE" && [ ! -f "$notify_file" ]; then
+        notify_totti "🔴 RC-Session $sess_name: Login abgelaufen (401). Bitte am Mac /login ausführen — der Watchdog kann das nicht selbst."
+        $DRY_RUN || touch "$notify_file"
+      fi
     fi
   else
     $DRY_RUN || touch "$state_file"
