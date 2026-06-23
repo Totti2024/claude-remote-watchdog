@@ -55,6 +55,58 @@ LOGIN_RE='Please run /login|401 Invalid authentication|token has expired'
 # Markers that prove a live Claude Code TUI is present (vs a crashed shell).
 CLAUDE_BAR_RE='bypass permissions|for agents|\? for shortcuts|esc to interrupt|/effort|/rc '
 
+# --- Whole-server resurrection (added 2026-06-23) ---------------------------
+# The classification logic above only repairs RC *inside* existing sessions.
+# It is blind to the catastrophic case where the whole tmux server crashes
+# (happened 2026-06-23 ~20:20): no server -> no panes -> the loop just reports
+# "No Remote Control sessions found" and nothing comes back. The LaunchAgent has
+# KeepAlive=false, so nothing else restarts it either. This preflight closes
+# that gap: if the server is dead OR any expected claude-rc-* session is missing,
+# we (re)launch them all via start-all-rc.sh (which is idempotent).
+EXPECTED_SESSIONS=(claude-rc-1 claude-rc-2 claude-rc-3 claude-rc-4 claude-rc-egov)
+START_ALL_SCRIPT="$HOME/remote-control-setup/start-all-rc.sh"
+# Shared lock with the rc-keepalive LaunchAgent (which also resurrects, every
+# ~60s). mkdir is atomic: whoever creates it first does the restart; the other
+# skips to avoid two concurrent start-all-rc.sh racing on the same session.
+RESURRECT_LOCK="/tmp/claude-rc-resurrect.lock"
+
+resurrect_server() {
+  local reason="$1"
+  if $DRY_RUN; then
+    echo "[DRY-RUN] Would resurrect tmux RC sessions ($reason) via $START_ALL_SCRIPT"
+    return 0
+  fi
+  # Verwaistes Lock brechen: kein legitimer Halter braucht es länger als
+  # start-all-rc.sh dauert (<30s). >3 Min = ein früherer Halter wurde mitten im
+  # Resurrect hart gekillt (SIGKILL/launchctl unload/Hang). Ohne diese Notbremse
+  # blockiert ein einziges verwaistes Lock BEIDE Schichten dauerhaft & lautlos.
+  if [ -d "$RESURRECT_LOCK" ] && find "$RESURRECT_LOCK" -maxdepth 0 -mmin +3 2>/dev/null | grep -q .; then
+    echo "[WARN] Breaking stale resurrect lock (>3 min old) -- previous holder was killed mid-resurrect"
+    rmdir "$RESURRECT_LOCK" 2>/dev/null || rm -rf "$RESURRECT_LOCK" 2>/dev/null || true
+  fi
+  if ! mkdir "$RESURRECT_LOCK" 2>/dev/null; then
+    echo "[SKIP] Resurrect already in progress (lock held by keepalive?) -- $reason"
+    return 0
+  fi
+  # Lock auch bei vorzeitigem Skript-Ende/Signal freigeben (deckt EXIT/INT/TERM;
+  # gegen SIGKILL hilft nur die Alters-Notbremse oben).
+  trap 'rmdir "$RESURRECT_LOCK" 2>/dev/null || true' EXIT INT TERM
+  echo "[ACTION] Resurrecting tmux RC sessions ($reason)..."
+  # If no server is running, clear any stale socket left behind by the crash.
+  if ! tmux list-sessions >/dev/null 2>&1; then
+    rm -f "/private/tmp/tmux-$(id -u)/default" "/tmp/tmux-$(id -u)/default" 2>/dev/null || true
+  fi
+  if [[ -x "$START_ALL_SCRIPT" ]]; then
+    "$START_ALL_SCRIPT" >/dev/null 2>&1 \
+      && echo "[OK] start-all-rc.sh launched -- sessions will connect within seconds" \
+      || echo "[ERR] start-all-rc.sh failed; will retry next run"
+  else
+    echo "[ERR] start-all-rc.sh not executable: $START_ALL_SCRIPT"
+  fi
+  rmdir "$RESURRECT_LOCK" 2>/dev/null || true
+  trap - EXIT INT TERM
+}
+
 # DEGRADED: RC stuck reconnecting -> cycle via the Disconnect menu dance.
 cycle_remote_control() {
   local pane_id="$1" label="$2"
@@ -91,6 +143,25 @@ reconnect_dead_rc() {
 # --- main ---
 
 echo "=== Remote Control Watchdog $(date '+%H:%M:%S') ==="
+
+# Preflight: is the house even standing? If the tmux server is dead or any
+# expected RC session is missing, resurrect them all and let the NEXT run verify
+# the connections (freshly booted sessions would otherwise misfire the grace
+# checks below). This is the only path that recovers a full server crash.
+if ! tmux list-sessions >/dev/null 2>&1; then
+  resurrect_server "tmux server dead"
+  echo "[OK] Preflight done -- skipping per-session checks this run"
+  exit 0
+fi
+missing=()
+for s in "${EXPECTED_SESSIONS[@]}"; do
+  tmux has-session -t "$s" 2>/dev/null || missing+=("$s")
+done
+if (( ${#missing[@]} > 0 )); then
+  resurrect_server "missing sessions: ${missing[*]}"
+  echo "[OK] Preflight done -- skipping per-session checks this run"
+  exit 0
+fi
 
 FOUND_ANY=false
 ALL_HEALTHY=true
