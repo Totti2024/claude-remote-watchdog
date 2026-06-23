@@ -39,6 +39,11 @@
 
 set -euo pipefail
 
+# Härtung (2026-06-23): nicht auf die crontab-PATH-Zeile verlassen. Stellt
+# sicher, dass tmux (/opt/homebrew/bin) gefunden wird, selbst wenn der Cron mit
+# Default-PATH läuft — sonst scheiterte jeder bare `tmux`-Aufruf still.
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
 DRY_RUN=false
 [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=true
 
