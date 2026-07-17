@@ -8,13 +8,24 @@
 #
 # Classification per session (wording-robust — works with old AND new Claude
 # Code status bars):
-#   HEALTHY    : pane shows an "active" RC indicator
-#                ("/rc active", "remote-control is active", "Remote Control active")
-#   DEGRADED   : pane shows an RC indicator that is reconnecting/connecting
-#                -> cycle via the Disconnect-menu dance (cycle_remote_control)
-#   GONE       : live Claude pane but NO RC indicator at all (e.g. hard 401
-#                "Please run /login") -> simple re-issue of /remote-control
-#   (shell)    : no Claude status bar -> skipped, never touched
+#   HEALTHY         : live Claude TUI AND an RC indicator is present somewhere
+#                      in the pane (banner "remote-control is active" or the
+#                      persistent footer "/rc" hint)
+#   DEGRADED        : pane shows an RC indicator that is reconnecting/connecting
+#                      -> cycle via the Disconnect-menu dance (cycle_remote_control)
+#   GONE            : live Claude pane but NO RC indicator at all (e.g. hard 401
+#                      "Please run /login") -> simple re-issue of /remote-control
+#   NEVER-CONNECTED : live Claude TUI, but NO RC indicator anywhere and NO 401
+#                      either -> the --rc flag's bridge registration itself
+#                      never came up, even though the process/pane is otherwise
+#                      perfectly healthy (this was previously misclassified as
+#                      HEALTHY because "bypass permissions" etc. are RC-agnostic
+#                      liveness markers -- see History 2026-07-17). Tier 1 =
+#                      re-issue /remote-control in-place; if that doesn't clear
+#                      it by the next cycle, tier 2 = full kill-session + fresh
+#                      `claude --rc` restart via rc-restart.sh (the only fix
+#                      that reliably worked on 2026-07-17).
+#   (shell)         : no Claude status bar -> skipped, never touched
 #
 # Anything that is not HEALTHY uses a 2-check grace period (first hit = WARN,
 # second consecutive = act) to avoid acting on transient boot/typing states.
@@ -23,7 +34,8 @@
 # Keychain credentials). This watchdog only re-establishes the RC connection
 # afterwards; it cannot perform the login itself.
 #
-# State files: /tmp/claude-remote-watchdog-*.fail   (2-check grace period)
+# State files: /tmp/claude-remote-watchdog-*.fail        (2-check grace period)
+#              /tmp/claude-remote-watchdog-*.escalated    (never-connected tier-1->2)
 #
 # History:
 #   2026-06-20  added GONE (hard-401) detection
@@ -36,6 +48,17 @@
 #               the /remote-control overlay blocked input. Inverted the logic:
 #               any live Claude TUI is healthy; act ONLY on a positive failure
 #               signal (RC reconnecting/connecting, or a hard 401/login prompt).
+#   2026-07-17  Found (manually) that 2 of 5 sessions restarted via rc-restart.sh
+#               never got the "/remote-control is active" banner or the "/rc"
+#               footer hint at all -- yet CLAUDE_BAR_RE ("bypass permissions"
+#               etc.) matched fine, so the old logic reported them HEALTHY.
+#               One session needed TWO full restarts before RC came up. Added
+#               the NEVER-CONNECTED state (live TUI + zero RC token anywhere)
+#               with its own tier-1 (in-place reconnect) / tier-2 (hard
+#               kill-session restart via rc-restart.sh) escalation, and
+#               tightened RC_TOKEN_RE to also match a trailing "/rc" with no
+#               following space (the footer hint gets clipped at the pane's
+#               right edge).
 
 set -euo pipefail
 
@@ -50,15 +73,21 @@ DRY_RUN=false
 STEP_WAIT=5  # seconds between tmux keystrokes (TUI needs time to render)
 
 # RC indicator wording (case-insensitive). "." matches both space and hyphen,
-# so it covers "Remote Control", "remote-control" and the short "/rc".
-RC_TOKEN_RE='/rc |remote.control'
+# so it covers "Remote Control", "remote-control" and the short "/rc". The
+# "/rc" footer hint often sits flush against the pane's right edge with no
+# trailing space -- match end-of-line or any non-word char after it too
+# (2026-07-17: the plain "/rc " form silently missed that clipped case).
+RC_TOKEN_RE='/rc([^a-zA-Z0-9_]|$)|remote.control'
 RC_HEALTHY_RE='active'           # kept for reference; no longer the health test
 RC_DEGRADED_RE='reconnect|connecting'
 # Positive failure signal: a hard 401 / expired login. This is the ONLY "gone"
 # signal we trust (see History 2026-06-23).
 LOGIN_RE='Please run /login|401 Invalid authentication|token has expired'
 # Markers that prove a live Claude Code TUI is present (vs a crashed shell).
-CLAUDE_BAR_RE='bypass permissions|for agents|\? for shortcuts|esc to interrupt|/effort|/rc '
+# Deliberately RC-agnostic (no "/rc" here, see History 2026-07-17): this must
+# stay true for a session whose RC bridge never connected at all, so that
+# branch can be told apart from real HEALTHY by RC_TOKEN_RE separately.
+CLAUDE_BAR_RE='bypass permissions|for agents|\? for shortcuts|esc to interrupt|/effort'
 
 # --- Notification (added 2026-06-23) ----------------------------------------
 # Bei einem harten 401 kann der Watchdog NICHT selbst heilen (nur der Mensch via
@@ -166,6 +195,33 @@ reconnect_dead_rc() {
   echo "[OK] Connect command sent to $pane_id ($label)"
 }
 
+# NEVER-CONNECTED tier 2: the in-place reconnect_dead_rc above already ran
+# once for this session and it is STILL never-connected on the next check --
+# the RC bridge registration is stuck in a way that a slash command inside
+# the process can't clear (confirmed 2026-07-17: session 3 needed this twice).
+# Only a full kill-session + fresh `claude --rc` start reliably fixes it, so
+# shell out to the same script Roman runs by hand for exactly this case.
+RC_RESTART_SCRIPT="$HOME/rc-restart.sh"
+
+restart_session_hard() {
+  local sess_name="$1"
+  if $DRY_RUN; then
+    echo "[DRY-RUN] Would hard-restart $sess_name via $RC_RESTART_SCRIPT (never-connected tier-2)"
+    return 0
+  fi
+  if [[ ! -x "$RC_RESTART_SCRIPT" ]]; then
+    echo "[ERR] $RC_RESTART_SCRIPT not executable -- cannot hard-restart $sess_name"
+    return 1
+  fi
+  echo "[ACTION] Hard-restarting $sess_name via rc-restart.sh (in-place reconnect already failed once)..."
+  if "$RC_RESTART_SCRIPT" "$sess_name" >/dev/null 2>&1; then
+    echo "[OK] $sess_name hard-restarted -- RC bridge should establish within seconds"
+    notify_totti "RC-Session $sess_name: RC-Bridge kam nach Neustart nie hoch. Watchdog hat automatisch einen Hard-Restart via rc-restart.sh ausgeloest. Alter Verlauf per /resume in der Session holbar."
+  else
+    echo "[ERR] rc-restart.sh failed for $sess_name; will retry next cycle"
+  fi
+}
+
 # --- main ---
 
 echo "=== Remote Control Watchdog $(date '+%H:%M:%S') ==="
@@ -205,6 +261,7 @@ while IFS= read -r line; do
   pane_full=$(tmux capture-pane -t "$pane_id" -p 2>/dev/null || true)
   state_file="/tmp/claude-remote-watchdog-${pane_id//[^a-zA-Z0-9]/_}.fail"
   notify_file="/tmp/claude-remote-watchdog-${pane_id//[^a-zA-Z0-9]/_}.notified"
+  esc_file="/tmp/claude-remote-watchdog-${pane_id//[^a-zA-Z0-9]/_}.escalated"
 
   # Last RC-indicator line = the status bar (earlier matches are scrollback).
   rc_line=$(echo "$pane_full" | grep -iE -- "$RC_TOKEN_RE" | tail -1 || true)
@@ -225,12 +282,18 @@ while IFS= read -r line; do
   elif echo "$pane_full" | grep -qiE -- "$LOGIN_RE"; then
     FOUND_ANY=true; ALL_HEALTHY=false
     kind="gone (401 / login required)"
-  # ---------- HEALTHY: live Claude TUI, no failure signal ----------
+  # ---------- NEVER-CONNECTED: live TUI, but RC bridge absent entirely ----------
+  # (no RC token anywhere in the pane, and it's not the 401 case either --
+  # see History 2026-07-17)
+  elif echo "$pane_full" | grep -qiE -- "$CLAUDE_BAR_RE" && [[ -z "$rc_line" ]]; then
+    FOUND_ANY=true; ALL_HEALTHY=false
+    kind="never-connected (live session, no RC bridge at all)"
+  # ---------- HEALTHY: live Claude TUI, RC token present, no failure signal ----------
   elif echo "$pane_full" | grep -qiE -- "$CLAUDE_BAR_RE"; then
     FOUND_ANY=true
-    # Wieder gesund -> Grace- UND Notify-Marker löschen (re-arm: ein späterer
-    # 401 löst dann wieder eine frische Telegram-Warnung aus).
-    $DRY_RUN || rm -f "$state_file" "$notify_file" 2>/dev/null
+    # Wieder gesund -> alle Grace-/Notify-/Escalation-Marker löschen (re-arm:
+    # ein späteres Problem löst dann wieder eine frische Warnung/Eskalation aus).
+    $DRY_RUN || rm -f "$state_file" "$notify_file" "$esc_file" 2>/dev/null
     echo "[HEALTHY] $sess_name ($pane_id)"
     continue
   # ---------- SKIP: no Claude bar (crashed shell, or a menu/overlay is open) ----------
@@ -246,6 +309,16 @@ while IFS= read -r line; do
     echo "[DEAD] $sess_name ($pane_id): $kind -- reconnecting"
     if echo "$rc_line" | grep -qiE -- "$RC_DEGRADED_RE"; then
       cycle_remote_control "$pane_id" "$sess_name"
+    elif [[ "$kind" == never-connected* ]]; then
+      if [[ -f "$esc_file" ]]; then
+        # Tier 1 (in-place reconnect) already ran once and it's still down ->
+        # escalate to a full session restart.
+        restart_session_hard "$sess_name"
+        $DRY_RUN || rm -f "$esc_file"
+      else
+        reconnect_dead_rc "$pane_id" "$sess_name"
+        $DRY_RUN || touch "$esc_file"
+      fi
     else
       reconnect_dead_rc "$pane_id" "$sess_name"
       # Harter 401: der Watchdog kann NICHT selbst heilen (nur /login durch
