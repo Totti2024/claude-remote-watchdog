@@ -34,8 +34,12 @@
 # Keychain credentials). This watchdog only re-establishes the RC connection
 # afterwards; it cannot perform the login itself.
 #
-# State files: /tmp/claude-remote-watchdog-*.fail        (2-check grace period)
-#              /tmp/claude-remote-watchdog-*.escalated    (never-connected tier-1->2)
+# State files (keyed by session name since 2026-07-17b, NOT pane_id):
+#   /tmp/claude-remote-watchdog-<sess>.fail       (2-check grace period)
+#   /tmp/claude-remote-watchdog-<sess>.notified   (401-Telegram dedup)
+#   /tmp/claude-remote-watchdog-<sess>.escalated  (never-connected tier-1->2)
+#   /tmp/claude-remote-watchdog-<sess>.t2last     (tier-2 30-min cooldown)
+#   /tmp/claude-remote-watchdog.running           (whole-script run lock)
 #
 # History:
 #   2026-06-20  added GONE (hard-401) detection
@@ -59,6 +63,29 @@
 #               tightened RC_TOKEN_RE to also match a trailing "/rc" with no
 #               following space (the footer hint gets clipped at the pane's
 #               right edge).
+#   2026-07-17b Hardening pass after a 4-agent audit of the whole RC stack:
+#               (1) all remediation tmux calls and the tier-2 invocation are
+#               now set-e-safe (a vanished pane or missing rc-restart.sh no
+#               longer aborts the whole run mid-loop, skipping later sessions);
+#               (2) state files are keyed by SESSION NAME, not pane_id --
+#               pane ids restart at %0 after a server crash, so a stale
+#               .escalated marker could have hard-restarted the WRONG session;
+#               (3) narrowed "/rc" in RC_TOKEN_RE to require a space or EOL
+#               after it (chat text like "~/rc-restart.sh" matched the old
+#               pattern and masked a genuinely dead bridge as HEALTHY); the
+#               "↯" glyph was evaluated and deliberately REJECTED as a token
+#               (it showed on the never-connected sessions too); (4) the GONE/401
+#               branch now also requires an ABSENT RC token -- conversation
+#               text quoting "Please run /login" on a healthy session no
+#               longer triggers a false 401 remediation; (5) whole-script
+#               run lock (stale-broken at >4 min) so overlapping cron ticks
+#               can't send keystrokes to the same pane concurrently -- also
+#               keeps the health-check watchdog call at the end of a
+#               tier-2-invoked rc-restart.sh from re-entering this run;
+#               (6) tier-2 hard restarts are rate-limited to one per session
+#               per 30 min (a structurally broken bridge no longer gets its
+#               session killed + Telegram-spammed every ~20 min); (7) a
+#               failed resurrect now notifies Totti instead of only logging.
 
 set -euo pipefail
 
@@ -72,12 +99,43 @@ DRY_RUN=false
 
 STEP_WAIT=5  # seconds between tmux keystrokes (TUI needs time to render)
 
+# --- Whole-script run lock (added 2026-07-17b) -------------------------------
+# Two overlapping runs (slow tick + next cron tick, or the health-check call at
+# the end of a tier-2-invoked rc-restart.sh) must never both send keystrokes to
+# the same pane. mkdir is atomic; a lock older than 4 min is stale (no
+# legitimate run takes that long) and gets broken. Dry-run is read-only and
+# skips the lock entirely so a manual probe never blocks the real cron.
+RUN_LOCK="/tmp/claude-remote-watchdog.running"
+RUN_LOCK_HELD=0
+RESURRECT_HELD=0
+cleanup_locks() {
+  [ "$RUN_LOCK_HELD" = "1" ] && rmdir "$RUN_LOCK" 2>/dev/null
+  [ "$RESURRECT_HELD" = "1" ] && rmdir "$RESURRECT_LOCK" 2>/dev/null
+  return 0
+}
+if ! $DRY_RUN; then
+  if [ -d "$RUN_LOCK" ] && find "$RUN_LOCK" -maxdepth 0 -mmin +4 2>/dev/null | grep -q .; then
+    echo "[WARN] Breaking stale run lock (>4 min old)"
+    rmdir "$RUN_LOCK" 2>/dev/null || rm -rf "$RUN_LOCK" 2>/dev/null || true
+  fi
+  if ! mkdir "$RUN_LOCK" 2>/dev/null; then
+    echo "[SKIP] Another watchdog run is in progress -- exiting"
+    exit 0
+  fi
+  RUN_LOCK_HELD=1
+  trap cleanup_locks EXIT INT TERM
+fi
+
 # RC indicator wording (case-insensitive). "." matches both space and hyphen,
-# so it covers "Remote Control", "remote-control" and the short "/rc". The
-# "/rc" footer hint often sits flush against the pane's right edge with no
-# trailing space -- match end-of-line or any non-word char after it too
-# (2026-07-17: the plain "/rc " form silently missed that clipped case).
-RC_TOKEN_RE='/rc([^a-zA-Z0-9_]|$)|remote.control'
+# so it covers "Remote Control", "remote-control" and the short "/rc".
+# "/rc" must be followed by a space or end-of-line: the footer hint is either
+# "/rc " mid-line or clipped flush at the pane's right edge (EOL). Anything
+# looser bites back -- "[^a-zA-Z0-9_]" also matched the hyphen in chat text
+# like "~/rc-restart.sh", masking a dead bridge as HEALTHY (2026-07-17b).
+# NOTE: the "↯" separator glyph is deliberately NOT a token -- it was present
+# on the 2026-07-17 never-connected sessions too (it means "--rc flag on",
+# not "bridge registered") and would mask exactly that failure again.
+RC_TOKEN_RE='/rc( |$)|remote.control'
 RC_HEALTHY_RE='active'           # kept for reference; no longer the health test
 RC_DEGRADED_RE='reconnect|connecting'
 # Positive failure signal: a hard 401 / expired login. This is the ONLY "gone"
@@ -143,23 +201,39 @@ resurrect_server() {
     echo "[SKIP] Resurrect already in progress (lock held by keepalive?) -- $reason"
     return 0
   fi
-  # Lock auch bei vorzeitigem Skript-Ende/Signal freigeben (deckt EXIT/INT/TERM;
-  # gegen SIGKILL hilft nur die Alters-Notbremse oben).
-  trap 'rmdir "$RESURRECT_LOCK" 2>/dev/null || true' EXIT INT TERM
+  # Freigabe bei vorzeitigem Skript-Ende/Signal übernimmt der zentrale
+  # cleanup_locks-Trap (2026-07-17b: die früheren lokalen trap/untrap-Zeilen
+  # hier hätten den Run-Lock-Release des Haupt-Traps überschrieben bzw.
+  # gelöscht -- ein Signal nach dem `trap -` hätte den Run-Lock verwaist).
+  RESURRECT_HELD=1
   echo "[ACTION] Resurrecting tmux RC sessions ($reason)..."
   # If no server is running, clear any stale socket left behind by the crash.
   if ! tmux list-sessions >/dev/null 2>&1; then
     rm -f "/private/tmp/tmux-$(id -u)/default" "/tmp/tmux-$(id -u)/default" 2>/dev/null || true
   fi
+  # Fehler-Benachrichtigung maximal 1x/Stunde (der Cron laeuft alle 5 Min --
+  # ohne Drossel waere ein dauerhaft kaputter Resurrect 12 Telegram-Pings/h).
+  local resurrect_notified="/tmp/claude-remote-watchdog-resurrect.notified"
   if [[ -x "$START_ALL_SCRIPT" ]]; then
-    "$START_ALL_SCRIPT" >/dev/null 2>&1 \
-      && echo "[OK] start-all-rc.sh launched -- sessions will connect within seconds" \
-      || echo "[ERR] start-all-rc.sh failed; will retry next run"
+    if "$START_ALL_SCRIPT" >/dev/null 2>&1; then
+      echo "[OK] start-all-rc.sh launched -- sessions will connect within seconds"
+      rm -f "$resurrect_notified" 2>/dev/null || true
+    else
+      echo "[ERR] start-all-rc.sh failed; will retry next run"
+      if ! find "$resurrect_notified" -maxdepth 0 -mmin -60 2>/dev/null | grep -q .; then
+        notify_totti "🔴 RC-Watchdog: Resurrect fehlgeschlagen ($reason) -- start-all-rc.sh Fehler. Naechster Cron-Lauf versucht es erneut; bitte bei Wiederholung manuell pruefen."
+        touch "$resurrect_notified"
+      fi
+    fi
   else
     echo "[ERR] start-all-rc.sh not executable: $START_ALL_SCRIPT"
+    if ! find "$resurrect_notified" -maxdepth 0 -mmin -60 2>/dev/null | grep -q .; then
+      notify_totti "🔴 RC-Watchdog: start-all-rc.sh nicht ausfuehrbar -- automatische Wiederbelebung unmoeglich, bitte manuell pruefen."
+      touch "$resurrect_notified"
+    fi
   fi
   rmdir "$RESURRECT_LOCK" 2>/dev/null || true
-  trap - EXIT INT TERM
+  RESURRECT_HELD=0
 }
 
 # DEGRADED: RC stuck reconnecting -> cycle via the Disconnect menu dance.
@@ -170,13 +244,16 @@ cycle_remote_control() {
     return 0
   fi
   echo "[ACTION] Cycling /remote-control (menu dance) on $pane_id ($label)..."
-  tmux send-keys -t "$pane_id" C-c; sleep 2
-  tmux send-keys -t "$pane_id" C-u; sleep 1
-  tmux send-keys -t "$pane_id" "/remote-control" Enter; sleep "$STEP_WAIT"
+  # Jeder send-keys mit || true (2026-07-17b): verschwindet die Pane zwischen
+  # Klassifikation und Remediation, wuerde set -e sonst das GANZE Skript mitten
+  # in der Tastatursequenz abbrechen -- spaetere Sessions blieben ungeprueft.
+  tmux send-keys -t "$pane_id" C-c 2>/dev/null || true; sleep 2
+  tmux send-keys -t "$pane_id" C-u 2>/dev/null || true; sleep 1
+  tmux send-keys -t "$pane_id" "/remote-control" Enter 2>/dev/null || true; sleep "$STEP_WAIT"
   # Navigate Up x2 to "Disconnect this session", select it, then reconnect.
-  tmux send-keys -t "$pane_id" Up Up; sleep 1
-  tmux send-keys -t "$pane_id" Enter; sleep "$STEP_WAIT"
-  tmux send-keys -t "$pane_id" "/remote-control" Enter
+  tmux send-keys -t "$pane_id" Up Up 2>/dev/null || true; sleep 1
+  tmux send-keys -t "$pane_id" Enter 2>/dev/null || true; sleep "$STEP_WAIT"
+  tmux send-keys -t "$pane_id" "/remote-control" Enter 2>/dev/null || true
   echo "[OK] Reconnect (menu dance) sent to $pane_id ($label)"
 }
 
@@ -189,9 +266,10 @@ reconnect_dead_rc() {
     return 0
   fi
   echo "[ACTION] (Re)connecting /remote-control on $pane_id ($label)..."
-  tmux send-keys -t "$pane_id" C-c; sleep 2
-  tmux send-keys -t "$pane_id" C-u; sleep 1
-  tmux send-keys -t "$pane_id" "/remote-control" Enter
+  # || true: siehe cycle_remote_control (set-e-Schutz bei verschwundener Pane).
+  tmux send-keys -t "$pane_id" C-c 2>/dev/null || true; sleep 2
+  tmux send-keys -t "$pane_id" C-u 2>/dev/null || true; sleep 1
+  tmux send-keys -t "$pane_id" "/remote-control" Enter 2>/dev/null || true
   echo "[OK] Connect command sent to $pane_id ($label)"
 }
 
@@ -259,9 +337,15 @@ while IFS= read -r line; do
   esac
 
   pane_full=$(tmux capture-pane -t "$pane_id" -p 2>/dev/null || true)
-  state_file="/tmp/claude-remote-watchdog-${pane_id//[^a-zA-Z0-9]/_}.fail"
-  notify_file="/tmp/claude-remote-watchdog-${pane_id//[^a-zA-Z0-9]/_}.notified"
-  esc_file="/tmp/claude-remote-watchdog-${pane_id//[^a-zA-Z0-9]/_}.escalated"
+  # State-Files nach SESSION-NAME, nicht pane_id (2026-07-17b): Pane-IDs
+  # starten nach einem Server-Crash wieder bei %0 -- ein verwaister
+  # .escalated-Marker der alten %0 haette die NEUE Session, die zufaellig %0
+  # bekommt, direkt auf Tier-2 (Hard-Restart) eskaliert, ohne dass je Tier 1
+  # lief. Session-Namen sind stabil (claude-rc-1..4, claude-rc-egov).
+  state_file="/tmp/claude-remote-watchdog-${sess_name//[^a-zA-Z0-9]/_}.fail"
+  notify_file="/tmp/claude-remote-watchdog-${sess_name//[^a-zA-Z0-9]/_}.notified"
+  esc_file="/tmp/claude-remote-watchdog-${sess_name//[^a-zA-Z0-9]/_}.escalated"
+  t2_file="/tmp/claude-remote-watchdog-${sess_name//[^a-zA-Z0-9]/_}.t2last"
 
   # Last RC-indicator line = the status bar (earlier matches are scrollback).
   rc_line=$(echo "$pane_full" | grep -iE -- "$RC_TOKEN_RE" | tail -1 || true)
@@ -279,7 +363,12 @@ while IFS= read -r line; do
     FOUND_ANY=true; ALL_HEALTHY=false
     kind="degraded (reconnecting/connecting)"
   # ---------- GONE: hard 401 / login required ----------
-  elif echo "$pane_full" | grep -qiE -- "$LOGIN_RE"; then
+  # Zusatzbedingung -z rc_line (2026-07-17b): Bei einem ECHTEN harten 401 ist
+  # der RC-Indikator komplett weg (dokumentiert 2026-06-20). Steht der
+  # RC-Indikator noch, ist "Please run /login" nur zitierter GESPRAECHSTEXT
+  # in einer gesunden Session -- ohne diese Bedingung wuerde der Watchdog dort
+  # Ctrl+C senden und laufende Arbeit abschiessen (False Positive).
+  elif [[ -z "$rc_line" ]] && echo "$pane_full" | grep -qiE -- "$LOGIN_RE"; then
     FOUND_ANY=true; ALL_HEALTHY=false
     kind="gone (401 / login required)"
   # ---------- NEVER-CONNECTED: live TUI, but RC bridge absent entirely ----------
@@ -312,9 +401,18 @@ while IFS= read -r line; do
     elif [[ "$kind" == never-connected* ]]; then
       if [[ -f "$esc_file" ]]; then
         # Tier 1 (in-place reconnect) already ran once and it's still down ->
-        # escalate to a full session restart.
-        restart_session_hard "$sess_name"
-        $DRY_RUN || rm -f "$esc_file"
+        # escalate to a full session restart. Rate-limited to one hard restart
+        # per session per 30 min (2026-07-17b): a structurally broken bridge
+        # would otherwise get killed + Telegram-notified every ~20 min forever.
+        # The esc_file stays in place during cooldown so the retry happens as
+        # soon as the window expires. || true: set-e-safe (a missing
+        # rc-restart.sh returns 1 and must not abort the whole run).
+        if find "$t2_file" -maxdepth 0 -mmin -30 2>/dev/null | grep -q .; then
+          echo "[SKIP] $sess_name: tier-2 cooldown active (last hard restart <30 min ago) -- retrying later"
+        else
+          restart_session_hard "$sess_name" || true
+          $DRY_RUN || { touch "$t2_file"; rm -f "$esc_file"; }
+        fi
       else
         reconnect_dead_rc "$pane_id" "$sess_name"
         $DRY_RUN || touch "$esc_file"
