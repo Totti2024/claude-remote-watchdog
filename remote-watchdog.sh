@@ -39,6 +39,8 @@
 #   /tmp/claude-remote-watchdog-<sess>.notified   (401-Telegram dedup)
 #   /tmp/claude-remote-watchdog-<sess>.escalated  (never-connected tier-1->2)
 #   /tmp/claude-remote-watchdog-<sess>.t2last     (tier-2 30-min cooldown)
+#   /tmp/claude-remote-watchdog-<sess>.draft      (stuck-draft grace: sig+mtime)
+#   /tmp/claude-remote-watchdog-<sess>.draftnotified (stuck-draft alert dedup)
 #   /tmp/claude-remote-watchdog.running           (whole-script run lock)
 #
 # History:
@@ -96,6 +98,26 @@
 #               + heavy swap), so this catches the squeeze BEFORE it crashes,
 #               instead of only resurrecting AFTER. Thresholds overridable in
 #               notify.env (RC_RAM_FREE_MIN_PCT / RC_RAM_SWAP_MAX_MB).
+#   2026-07-18b Added the STUCK-DRAFT watch (handle_stuck_draft). Symptom
+#               diagnosed live: the /remote-control relay delivers a phone-typed
+#               message into the input box as a DRAFT but the submit never fires
+#               -- the text just sits there unsent, the session stays HEALTHY
+#               (RC connected) and silently never answers. Confirmed it is the
+#               relay's submit, not tmux/watchdog/login: a locally typed Enter
+#               submits fine, but a bare Enter on the relay-owned draft does not
+#               -- only Ctrl+U clear -> retype -> Enter reliably submits it, and
+#               that is exactly what the auto-drain does. The health check was
+#               blind because it only verifies the RC *connection* indicator,
+#               not that input submits. SAFETY: auto-drain fires ONLY for a
+#               single-line plain-TEXT draft, idle & unchanged >= DRAFT_STUCK_MIN
+#               min, re-checked immediately before sending; slash/bang commands,
+#               multi-line/wrapped drafts (capture may be truncated) and menu
+#               selections are NEVER auto-sent, only alerted once. Gotcha found
+#               in test: the "empty" input box is ❯ + NBSP padding, and under the
+#               cron C locale [:space:] does NOT strip NBSP -- so the draft
+#               parser now strips NBSP/ZWSP/BOM explicitly (locale-independent)
+#               before the emptiness test, else every idle box looked like a
+#               2-space text draft and would have been auto-drained.
 
 set -euo pipefail
 
@@ -355,6 +377,131 @@ check_ram() {
   return 0
 }
 
+# --- Stuck-draft watch (added 2026-07-18) -----------------------------------
+# The /remote-control input relay sometimes delivers a phone-typed message into
+# the input box as a DRAFT but the submit never fires -- the message just sits
+# there unsent, so the session looks HEALTHY (RC connected) yet silently never
+# answers (diagnosed 2026-07-18: local tmux Enter submits fine, so it is the
+# relay's submit, not tmux/watchdog/login). The health check is blind to it
+# because it only verifies the RC *connection* indicator, not that input
+# actually submits. This watch catches a stuck draft and, for the SAFE case
+# only, auto-submits it (the proven manual fix: Ctrl+U clear -> retype -> Enter).
+#
+# SAFETY (these sessions run with bypass-permissions, so an auto-submit runs as
+# a real prompt): auto-drain fires ONLY for a single-line plain-TEXT draft that
+# has been idle & byte-for-byte unchanged for >= DRAFT_STUCK_MIN minutes, with a
+# fresh re-check immediately before sending (race guard vs. the user mid-typing).
+# Anything else -- a slash/bang command, a multi-line/wrapped draft (capture may
+# be truncated -> retyping would send the WRONG text), or a menu selection -- is
+# NEVER auto-sent; it only raises a one-shot Telegram alert. Grace + dedup use
+# the same session-keyed /tmp state-file idiom as the RC remediation above.
+DRAFT_STUCK_MIN="${RC_DRAFT_STUCK_MIN:-9}"   # act once a draft is unchanged >= N min
+
+# Populate DR_* globals from a live capture of the pane.
+#   DR_IDLE=<0|1>  DR_KIND=<empty|text|cmd|menu|multiline>  DR_DRAFTABLE=<0|1>
+#   DR_TEXT=<draft>  DR_LINES=<non-empty lines inside the input box>
+_dr_extract() {  # $1 = pane_id
+  local pane_id="$1" full bnums top bot region draftline d
+  DR_IDLE=1; DR_KIND=empty; DR_DRAFTABLE=0; DR_TEXT=""; DR_LINES=0
+  full=$(tmux capture-pane -t "$pane_id" -p 2>/dev/null || true)
+  [ -z "$full" ] && return 0
+  # Busy iff the footer (last few lines) shows the interrupt hint.
+  if printf '%s\n' "$full" | tail -4 | grep -q 'esc to interrupt'; then DR_IDLE=0; fi
+  # The input box is bounded by the last two long ─ border lines; the footer is
+  # below the lower border. The draft is the ❯-line strictly between them.
+  bnums=$(printf '%s\n' "$full" | grep -nE '─────' | cut -d: -f1 || true)
+  top=$(printf '%s\n' "$bnums" | tail -2 | head -1)
+  bot=$(printf '%s\n' "$bnums" | tail -1)
+  { [ -n "$top" ] && [ -n "$bot" ] && [ "$bot" -gt "$top" ]; } || return 0
+  region=$(printf '%s\n' "$full" | sed -n "$((top+1)),$((bot-1))p")
+  DR_LINES=$(printf '%s\n' "$region" | grep -c . || true)
+  draftline=$(printf '%s\n' "$region" | grep -m1 '^❯' || true)
+  [ -n "$draftline" ] || return 0
+  d=${draftline#❯}
+  # The "empty" input box is NOT really empty: it renders as ❯ + a few
+  # placeholder chars (NBSP U+00A0, occasionally ZWSP/BOM). Strip those and any
+  # ASCII whitespace LOCALE-INDEPENDENTLY. Cron runs in the C locale, where
+  # [:space:] does NOT cover NBSP -- so the old [:space:] trim left the padding
+  # in place, misread an empty box as a text draft, and would eventually have
+  # auto-drained garbage. printf builds the exact multibyte sequences so we
+  # never chop a legit char (ä/é/à share bytes with NBSP) apart.
+  local nbsp zwsp bom
+  nbsp=$(printf '\302\240'); zwsp=$(printf '\342\200\213'); bom=$(printf '\357\273\277')
+  d=${d//$nbsp/ }; d=${d//$zwsp/}; d=${d//$bom/}
+  d=$(printf '%s' "$d" | LC_ALL=C sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  DR_TEXT="$d"
+  [ -z "$d" ] && { DR_KIND=empty; return 0; }
+  case "$d" in
+    [0-9].*|[0-9][0-9].*) DR_KIND=menu ;;   # "1. Yes" style selection cursor
+    /*|'!'*)              DR_KIND=cmd  ;;   # slash command / bash-bang
+    *)                    DR_KIND=text ;;
+  esac
+  if [ "${DR_LINES:-0}" -gt 1 ]; then DR_KIND=multiline; fi   # wrapped/multiline
+  if [ "$DR_KIND" = text ]; then DR_DRAFTABLE=1; fi
+  return 0
+}
+
+# Grace-period + (safe) remediation for a stuck input draft on a HEALTHY session.
+handle_stuck_draft() {  # $1 = pane_id   $2 = sess_name
+  local pane_id="$1" sess="$2" key sig prev safe
+  key="${sess//[^a-zA-Z0-9]/_}"
+  local draft_file="/tmp/claude-remote-watchdog-${key}.draft"
+  local dnote_file="/tmp/claude-remote-watchdog-${key}.draftnotified"
+
+  _dr_extract "$pane_id"
+  # Box empty or session busy -> nothing stuck; clear grace + dedup (re-arm).
+  if [ "$DR_IDLE" != "1" ] || [ "$DR_KIND" = empty ] || [ -z "$DR_TEXT" ]; then
+    $DRY_RUN || rm -f "$draft_file" "$dnote_file" 2>/dev/null || true
+    return 0
+  fi
+
+  sig="$DR_KIND|$DR_TEXT"
+  prev=""
+  [ -f "$draft_file" ] && prev=$(head -1 "$draft_file" 2>/dev/null || true)
+  if [ "$prev" != "$sig" ]; then
+    # First sighting, or the draft changed (user is editing) -> (re)start grace.
+    $DRY_RUN || printf '%s\n' "$sig" > "$draft_file"
+    echo "[DRAFT] $sess: unsent draft seen ($DR_KIND) -- grace started: '${DR_TEXT:0:60}'"
+    return 0
+  fi
+  # Signature unchanged: only act once the grace file is >= DRAFT_STUCK_MIN old.
+  if ! find "$draft_file" -maxdepth 0 -mmin +"$DRAFT_STUCK_MIN" 2>/dev/null | grep -q .; then
+    echo "[DRAFT] $sess: draft within grace (<${DRAFT_STUCK_MIN} min) -- '${DR_TEXT:0:60}'"
+    return 0
+  fi
+
+  safe=${DR_TEXT//\\/}; safe=${safe//\"/}   # sanitise for the JSON/osascript alert
+  if [ "$DR_DRAFTABLE" = 1 ]; then
+    if $DRY_RUN; then
+      echo "[DRY-RUN][DRAFT] Would auto-drain on $sess: '$DR_TEXT'"
+      return 0
+    fi
+    # Race guard: re-capture right before sending; abort if it changed/moved.
+    _dr_extract "$pane_id"
+    if [ "$DR_DRAFTABLE" != 1 ] || [ "$DR_IDLE" != "1" ] || [ "$DR_KIND|$DR_TEXT" != "$sig" ]; then
+      printf '%s\n' "$DR_KIND|$DR_TEXT" > "$draft_file"
+      echo "[DRAFT] $sess: draft moved just before auto-drain -- reconfirming next check"
+      return 0
+    fi
+    echo "[ACTION][DRAFT] Auto-draining stuck message on $sess: '$DR_TEXT'"
+    # The proven manual fix: clear the relay-owned draft, retype locally, submit.
+    # || true throughout: a pane that vanishes mid-sequence must not abort the run.
+    tmux send-keys -t "$pane_id" C-u 2>/dev/null || true; sleep 1
+    tmux send-keys -t "$pane_id" -l "$DR_TEXT" 2>/dev/null || true; sleep 1
+    tmux send-keys -t "$pane_id" Enter 2>/dev/null || true
+    notify_totti "📤 RC-Watchdog: Session $sess hatte eine ungesendete Nachricht (Remote-Submit-Bug) haengen und ich habe sie automatisch abgeschickt: „$safe“"
+    rm -f "$draft_file" 2>/dev/null || true   # box empties; next tick re-arms dedup
+  else
+    # cmd / menu / multiline -> never auto-send; warn Totti exactly once.
+    if [ ! -f "$dnote_file" ]; then
+      notify_totti "⚠️ RC-Watchdog: Session $sess hat seit >${DRAFT_STUCK_MIN} min eine ungesendete Eingabe ($DR_KIND), die ich aus Sicherheitsgruenden NICHT automatisch sende: „${safe:0:120}“. Bitte am Geraet pruefen/abschicken."
+      $DRY_RUN || touch "$dnote_file"
+    fi
+    echo "[DRAFT] $sess: stuck but not auto-drainable ($DR_KIND) -- alert only"
+  fi
+  return 0
+}
+
 # --- main ---
 
 echo "=== Remote Control Watchdog $(date '+%H:%M:%S') ==="
@@ -438,6 +585,9 @@ while IFS= read -r line; do
     # Wieder gesund -> alle Grace-/Notify-/Escalation-Marker löschen (re-arm:
     # ein späteres Problem löst dann wieder eine frische Warnung/Eskalation aus).
     $DRY_RUN || rm -f "$state_file" "$notify_file" "$esc_file" 2>/dev/null
+    # A HEALTHY session (RC connected) can still be silently stuck on an unsent
+    # relay draft -- detect + safely auto-submit it (see Stuck-draft watch).
+    handle_stuck_draft "$pane_id" "$sess_name"
     echo "[HEALTHY] $sess_name ($pane_id)"
     continue
   # ---------- SKIP: no Claude bar (crashed shell, or a menu/overlay is open) ----------
