@@ -86,6 +86,16 @@
 #               per 30 min (a structurally broken bridge no longer gets its
 #               session killed + Telegram-spammed every ~20 min); (7) a
 #               failed resurrect now notifies Totti instead of only logging.
+#   2026-07-18  Added a PASSIVE RAM watch (check_ram): warns Totti via Telegram
+#               (dedup 1x/h) when free memory drops to/below RC_RAM_FREE_MIN_PCT%
+#               or swap used reaches RC_RAM_SWAP_MAX_MB MB. Read-only by design
+#               (Memory rule "backup/system infra: analyse only") -- it NEVER
+#               kills or restarts anything on low RAM. Rationale: the prime
+#               suspect for the 2026-06-23 whole-server crash was a creeping
+#               memory squeeze (4-agent audit 2026-07-17 measured ~247 MB free
+#               + heavy swap), so this catches the squeeze BEFORE it crashes,
+#               instead of only resurrecting AFTER. Thresholds overridable in
+#               notify.env (RC_RAM_FREE_MIN_PCT / RC_RAM_SWAP_MAX_MB).
 
 set -euo pipefail
 
@@ -300,6 +310,51 @@ restart_session_hard() {
   fi
 }
 
+# --- Passive RAM watch (added 2026-07-18) -----------------------------------
+# Warn-only. NEVER acts on the system (no kill, no restart) -- see History
+# 2026-07-18 and the Memory rule "backup/system infra: analyse only". Reads two
+# cheap, sudo-free signals: system-wide free-RAM % (memory_pressure -Q) and swap
+# used in MB (sysctl vm.swapusage). If either crosses its threshold, Totti gets
+# ONE Telegram warning per hour (same dedup pattern as the 401/resurrect alerts).
+RAM_FREE_MIN_PCT="${RC_RAM_FREE_MIN_PCT:-5}"    # warn when free% <= this
+RAM_SWAP_MAX_MB="${RC_RAM_SWAP_MAX_MB:-1800}"   # warn when swap used MB >= this
+RAM_NOTIFIED="/tmp/claude-remote-watchdog-ram.notified"
+
+check_ram() {
+  local free_pct swap_used_mb
+  free_pct=$(memory_pressure -Q 2>/dev/null \
+    | awk -F': ' '/free percentage/{gsub(/%/,"",$2); print int($2); exit}')
+  swap_used_mb=$(sysctl -n vm.swapusage 2>/dev/null \
+    | awk '{for(i=1;i<=NF;i++) if($i=="used"){v=$(i+2); gsub(/[Mm]/,"",v); print int(v); exit}}')
+
+  # If either probe couldn't be parsed, skip silently rather than false-alarm.
+  if [[ -z "$free_pct" || -z "$swap_used_mb" ]]; then
+    echo "[RAM] skipped (could not read memory stats)"
+    return 0
+  fi
+
+  local msgs=()
+  if (( free_pct <= RAM_FREE_MIN_PCT )); then
+    msgs+=("nur ${free_pct}% RAM frei (Schwelle ${RAM_FREE_MIN_PCT}%)")
+  fi
+  if (( swap_used_mb >= RAM_SWAP_MAX_MB )); then
+    msgs+=("Swap ${swap_used_mb} MB belegt (Schwelle ${RAM_SWAP_MAX_MB} MB)")
+  fi
+
+  if (( ${#msgs[@]} > 0 )); then
+    local detail; detail=$(printf '%s; ' "${msgs[@]}"); detail=${detail%; }
+    echo "[WARN][RAM] $detail"
+    if ! $DRY_RUN && ! find "$RAM_NOTIFIED" -maxdepth 0 -mmin -60 2>/dev/null | grep -q .; then
+      notify_totti "🟠 RC-Watchdog: RAM knapp, $detail. Kein Auto-Eingriff (nur Analyse). Tipp: nicht gebrauchte Sessions per /clear leeren oder ~/rc-restart.sh, Fremd-Apps (Safari, mysqld) schliessen."
+      touch "$RAM_NOTIFIED"
+    fi
+  else
+    echo "[RAM] ok (${free_pct}% frei, Swap ${swap_used_mb} MB)"
+    $DRY_RUN || rm -f "$RAM_NOTIFIED" 2>/dev/null || true
+  fi
+  return 0
+}
+
 # --- main ---
 
 echo "=== Remote Control Watchdog $(date '+%H:%M:%S') ==="
@@ -439,3 +494,6 @@ if ! $FOUND_ANY; then
 elif $ALL_HEALTHY; then
   echo "[OK] All Remote Control sessions healthy"
 fi
+
+# Passive RAM watch runs every tick regardless of session health (read-only).
+check_ram
