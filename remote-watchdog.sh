@@ -131,6 +131,17 @@
 #               char (U+2026) at either end, or whose raw ❯-line fills the pane
 #               width, is classified DR_KIND=truncated -> alert-only, never
 #               auto-drained (same safe path as cmd/menu/multiline).
+#   2026-07-19b AUTO-DRAIN DISABLED BY DEFAULT (RC_DRAFT_AUTODRAIN, default 0).
+#               Second ghost incident the same evening: the relay drip-feeds a
+#               QUEUE of old/never-sent inputs into the rc-2 box -- each time
+#               the box empties, the next item appears ('/update obsidian'
+#               resurfaced an hour after it had already run). Auto-drain then
+#               submitted queue items as real prompts that Roman never sent
+#               ("Ja, bau den Fix..." triggered a repo commit + a read of his
+#               employment contract). The core assumption "whatever sits in
+#               the box was meant to be sent" is disproven -> the watchdog now
+#               only ALERTS on stuck drafts (Telegram) and never submits them
+#               unless RC_DRAFT_AUTODRAIN=1 is set explicitly in notify.env.
 
 set -euo pipefail
 
@@ -411,6 +422,13 @@ check_ram() {
 # NEVER auto-sent; it only raises a one-shot Telegram alert. Grace + dedup use
 # the same session-keyed /tmp state-file idiom as the RC remediation above.
 DRAFT_STUCK_MIN="${RC_DRAFT_STUCK_MIN:-9}"   # act once a draft is unchanged >= N min
+# Master switch for the auto-submit path. 0 (default) = alert-only: NEVER
+# auto-send a stuck draft, regardless of kind. Set RC_DRAFT_AUTODRAIN=1 in
+# notify.env to re-enable the old behavior. Default flipped to 0 on 2026-07-19
+# after two ghost-message incidents (see changelog 2026-07-19b): the relay
+# turned out to drip-feed a queue of stale inputs into the box, so box content
+# does NOT reliably represent what the user wants sent.
+DRAFT_AUTODRAIN="${RC_DRAFT_AUTODRAIN:-0}"
 
 # Populate DR_* globals from a live capture of the pane.
 #   DR_IDLE=<0|1>  DR_KIND=<empty|text|cmd|menu|multiline>  DR_DRAFTABLE=<0|1>
@@ -507,7 +525,7 @@ handle_stuck_draft() {  # $1 = pane_id   $2 = sess_name
   fi
 
   safe=${DR_TEXT//\\/}; safe=${safe//\"/}   # sanitise for the JSON/osascript alert
-  if [ "$DR_DRAFTABLE" = 1 ]; then
+  if [ "$DR_DRAFTABLE" = 1 ] && [ "$DRAFT_AUTODRAIN" = "1" ]; then
     if $DRY_RUN; then
       echo "[DRY-RUN][DRAFT] Would auto-drain on $sess: '$DR_TEXT'"
       return 0
@@ -528,12 +546,17 @@ handle_stuck_draft() {  # $1 = pane_id   $2 = sess_name
     notify_totti "📤 RC-Watchdog: Session $sess hatte eine ungesendete Nachricht (Remote-Submit-Bug) haengen und ich habe sie automatisch abgeschickt: „$safe“"
     rm -f "$draft_file" 2>/dev/null || true   # box empties; next tick re-arms dedup
   else
-    # cmd / menu / multiline -> never auto-send; warn Totti exactly once.
+    # Alert-only path: auto-drain globally disabled, or the kind is unsafe
+    # (cmd / menu / multiline / truncated). Warn Totti exactly once per draft.
     if [ ! -f "$dnote_file" ]; then
-      notify_totti "⚠️ RC-Watchdog: Session $sess hat seit >${DRAFT_STUCK_MIN} min eine ungesendete Eingabe ($DR_KIND), die ich aus Sicherheitsgruenden NICHT automatisch sende: „${safe:0:120}“. Bitte am Geraet pruefen/abschicken."
+      notify_totti "⚠️ RC-Watchdog: Session $sess hat seit >${DRAFT_STUCK_MIN} min eine ungesendete Eingabe ($DR_KIND), die ich NICHT automatisch sende: „${safe:0:120}“. Bitte am Geraet pruefen und selbst abschicken oder loeschen."
       $DRY_RUN || touch "$dnote_file"
     fi
-    echo "[DRAFT] $sess: stuck but not auto-drainable ($DR_KIND) -- alert only"
+    if [ "$DR_DRAFTABLE" = 1 ]; then
+      echo "[DRAFT] $sess: stuck ($DR_KIND) -- auto-drain disabled, alert only"
+    else
+      echo "[DRAFT] $sess: stuck but not auto-drainable ($DR_KIND) -- alert only"
+    fi
   fi
   return 0
 }
