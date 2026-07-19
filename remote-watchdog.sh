@@ -118,6 +118,19 @@
 #               parser now strips NBSP/ZWSP/BOM explicitly (locale-independent)
 #               before the emptiness test, else every idle box looked like a
 #               2-space text draft and would have been auto-drained.
+#   2026-07-19  TRUNCATION guard for the stuck-draft watch. Incident 19.07.2026
+#               ~20:40: a LONG single-line draft ("kannst du die Kuendigungs-
+#               frist ... der liegt in iCloud unter Dokumente/Arbeitsvertrag")
+#               was horizontally clipped by the TUI (input box scrolls long
+#               lines and renders an ellipsis at the clipped edge). The capture
+#               held only the visible FRAGMENT ("...der liegt…"), DR_LINES was
+#               1, so the multiline guard did not fire and the auto-drain sent
+#               the cut-off fragment as a real prompt; the clipped tail ("in
+#               iCloud unter Dokumente/Arbeitsvertrag") surfaced as a NEW draft
+#               one tick later. Fix: a draft whose text carries the ellipsis
+#               char (U+2026) at either end, or whose raw ❯-line fills the pane
+#               width, is classified DR_KIND=truncated -> alert-only, never
+#               auto-drained (same safe path as cmd/menu/multiline).
 
 set -euo pipefail
 
@@ -392,7 +405,9 @@ check_ram() {
 # has been idle & byte-for-byte unchanged for >= DRAFT_STUCK_MIN minutes, with a
 # fresh re-check immediately before sending (race guard vs. the user mid-typing).
 # Anything else -- a slash/bang command, a multi-line/wrapped draft (capture may
-# be truncated -> retyping would send the WRONG text), or a menu selection -- is
+# be truncated -> retyping would send the WRONG text), a horizontally clipped
+# draft (TUI scrolls long lines, renders "…" at the clipped edge -- the capture
+# is a fragment; bit us live on 19.07.2026), or a menu selection -- is
 # NEVER auto-sent; it only raises a one-shot Telegram alert. Grace + dedup use
 # the same session-keyed /tmp state-file idiom as the RC remediation above.
 DRAFT_STUCK_MIN="${RC_DRAFT_STUCK_MIN:-9}"   # act once a draft is unchanged >= N min
@@ -437,6 +452,27 @@ _dr_extract() {  # $1 = pane_id
     *)                    DR_KIND=text ;;
   esac
   if [ "${DR_LINES:-0}" -gt 1 ]; then DR_KIND=multiline; fi   # wrapped/multiline
+  # Horizontal-truncation guard (2026-07-19): the TUI scrolls a long one-line
+  # draft horizontally and renders an ellipsis (U+2026) at the clipped edge, so
+  # the capture holds only a FRAGMENT while DR_LINES stays 1. Auto-draining
+  # that fragment submits a wrong, cut-off prompt (incident 19.07.2026 -- the
+  # clipped tail then resurfaced as a "new" draft one tick later). A draft with
+  # the ellipsis char at either end, or whose raw ❯-line fills the pane width,
+  # is truncation risk -> alert-only. The width test counts chars via wc -m,
+  # which under the cron C locale counts BYTES and thus overshoots for
+  # umlauts -- that errs toward "truncated", i.e. toward NOT sending: safe.
+  local ell pw dlen
+  ell=$(printf '\342\200\246')
+  case "$d" in
+    "$ell"*|*"$ell") DR_KIND=truncated ;;
+  esac
+  if [ "$DR_KIND" = text ]; then
+    pw=$(tmux display-message -p -t "$pane_id" '#{pane_width}' 2>/dev/null || echo 0)
+    dlen=$(printf '%s' "$draftline" | wc -m | tr -d '[:space:]')
+    if [ "${pw:-0}" -gt 0 ] 2>/dev/null && [ "${dlen:-0}" -ge $((pw - 1)) ] 2>/dev/null; then
+      DR_KIND=truncated
+    fi
+  fi
   if [ "$DR_KIND" = text ]; then DR_DRAFTABLE=1; fi
   return 0
 }
