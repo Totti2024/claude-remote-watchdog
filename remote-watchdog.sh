@@ -142,6 +142,18 @@
 #               the box was meant to be sent" is disproven -> the watchdog now
 #               only ALERTS on stuck drafts (Telegram) and never submits them
 #               unless RC_DRAFT_AUTODRAIN=1 is set explicitly in notify.env.
+#   2026-07-19c AUTO-CLEAR stuck drafts (RC_DRAFT_AUTOCLEAR, default 1).
+#               Third ghost incident: a draft appeared that answered Claude's
+#               latest question, phrased in Roman's voice, which Roman never
+#               wrote; in parallel rc-1 held a draft matching ITS session
+#               context. Working hypothesis: the claude.ai client generates
+#               suggested replies and a relay bug deposits them into the input
+#               box. Roman confirmed these drafts are INVISIBLE in the client
+#               UI -- he can neither see nor delete them from his phone, and a
+#               stray Enter would submit them on a bypass-permissions session.
+#               New behavior: alert with the FULL text (up to 200 chars), then
+#               race-guarded Ctrl+U clear + verify; genuine stuck messages can
+#               be retyped from the alert.
 
 set -euo pipefail
 
@@ -429,6 +441,14 @@ DRAFT_STUCK_MIN="${RC_DRAFT_STUCK_MIN:-9}"   # act once a draft is unchanged >= 
 # turned out to drip-feed a queue of stale inputs into the box, so box content
 # does NOT reliably represent what the user wants sent.
 DRAFT_AUTODRAIN="${RC_DRAFT_AUTODRAIN:-0}"
+# Auto-CLEAR stuck drafts (2026-07-19c, third ghost incident): after the
+# Telegram alert (which carries the full text), the watchdog deletes the
+# stuck draft from the input box via Ctrl+U. Rationale: ghost drafts are
+# invisible in the claude.ai client (Roman can neither see nor delete them
+# remotely) and would be submitted by any stray Enter on these
+# bypass-permissions sessions. A genuine stuck message can be retyped from
+# the alert text. RC_DRAFT_AUTOCLEAR=0 restores pure alert-only.
+DRAFT_AUTOCLEAR="${RC_DRAFT_AUTOCLEAR:-1}"
 
 # Populate DR_* globals from a live capture of the pane.
 #   DR_IDLE=<0|1>  DR_KIND=<empty|text|cmd|menu|multiline>  DR_DRAFTABLE=<0|1>
@@ -546,13 +566,48 @@ handle_stuck_draft() {  # $1 = pane_id   $2 = sess_name
     notify_totti "📤 RC-Watchdog: Session $sess hatte eine ungesendete Nachricht (Remote-Submit-Bug) haengen und ich habe sie automatisch abgeschickt: „$safe“"
     rm -f "$draft_file" 2>/dev/null || true   # box empties; next tick re-arms dedup
   else
-    # Alert-only path: auto-drain globally disabled, or the kind is unsafe
-    # (cmd / menu / multiline / truncated). Warn Totti exactly once per draft.
+    # Alert + auto-CLEAR path (2026-07-19c). Ghost drafts (relay-injected,
+    # AI-suggested texts the user never typed -- see changelog) are INVISIBLE
+    # in the claude.ai client, so Roman cannot see, send, or delete them from
+    # his phone; they exist only in the tmux input box. Leaving them there
+    # means any stray Enter on a bypass-permissions session submits them as a
+    # real prompt. So: alert Totti with the FULL text first (nothing is lost
+    # -- a genuine stuck message can be retyped from the alert), then clear
+    # the box with Ctrl+U. RC_DRAFT_AUTOCLEAR=0 in notify.env restores pure
+    # alert-only. Never cleared in dry-run.
     if [ ! -f "$dnote_file" ]; then
-      notify_totti "⚠️ RC-Watchdog: Session $sess hat seit >${DRAFT_STUCK_MIN} min eine ungesendete Eingabe ($DR_KIND), die ich NICHT automatisch sende: „${safe:0:120}“. Bitte am Geraet pruefen und selbst abschicken oder loeschen."
+      if [ "$DRAFT_AUTOCLEAR" = "1" ]; then
+        notify_totti "⚠️ RC-Watchdog: Session $sess hat seit >${DRAFT_STUCK_MIN} min eine ungesendete Eingabe ($DR_KIND), die ich NICHT sende, sondern aus der Eingabebox LOESCHE: „${safe:0:200}“. Falls die Nachricht echt von dir war: bitte neu senden."
+      else
+        notify_totti "⚠️ RC-Watchdog: Session $sess hat seit >${DRAFT_STUCK_MIN} min eine ungesendete Eingabe ($DR_KIND), die ich NICHT automatisch sende: „${safe:0:120}“. Bitte am Geraet pruefen und selbst abschicken oder loeschen."
+      fi
       $DRY_RUN || touch "$dnote_file"
     fi
-    if [ "$DR_DRAFTABLE" = 1 ]; then
+    if [ "$DRAFT_AUTOCLEAR" = "1" ]; then
+      if $DRY_RUN; then
+        echo "[DRY-RUN][DRAFT] Would auto-clear on $sess: '${DR_TEXT:0:60}'"
+        return 0
+      fi
+      # Race guard: re-capture right before clearing; abort if the draft
+      # changed or the session went busy (user might be typing right now).
+      _dr_extract "$pane_id"
+      if [ "$DR_IDLE" != "1" ] || [ "$DR_KIND|$DR_TEXT" != "$sig" ]; then
+        printf '%s\n' "$DR_KIND|$DR_TEXT" > "$draft_file"
+        echo "[DRAFT] $sess: draft moved just before auto-clear -- reconfirming next check"
+        return 0
+      fi
+      tmux send-keys -t "$pane_id" C-u 2>/dev/null || true; sleep 1
+      # Verify: if text is still in the box (e.g. multi-line draft where C-u
+      # only cleared one line), say so instead of pretending it is gone.
+      _dr_extract "$pane_id"
+      if [ "$DR_KIND" = empty ] || [ -z "$DR_TEXT" ]; then
+        echo "[ACTION][DRAFT] Auto-cleared stuck draft on $sess (text was alerted via Telegram)"
+        rm -f "$draft_file" 2>/dev/null || true   # box empty; next tick re-arms dedup
+      else
+        echo "[WARN][DRAFT] $sess: C-u did not fully clear the draft -- remaining: '${DR_TEXT:0:60}'"
+        printf '%s\n' "$DR_KIND|$DR_TEXT" > "$draft_file"
+      fi
+    elif [ "$DR_DRAFTABLE" = 1 ]; then
       echo "[DRAFT] $sess: stuck ($DR_KIND) -- auto-drain disabled, alert only"
     else
       echo "[DRAFT] $sess: stuck but not auto-drainable ($DR_KIND) -- alert only"
