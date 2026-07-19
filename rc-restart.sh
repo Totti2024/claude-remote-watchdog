@@ -19,11 +19,11 @@ EGOV="/Users/romanmathismacmini/Projekte/flowable-egov-apps"
 
 # Session-Definition:  name | arbeitsverzeichnis | claude-startbefehl
 DEFS=(
-  "claude-rc-1|$OBS|claude --rc --name TottiObsidian-1"
-  "claude-rc-2|$OBS|claude --rc --name TottiObsidian-2"
-  "claude-rc-3|$OBS|claude --rc --name TottiObsidian-3"
-  "claude-rc-4|$OBS|claude --rc --name TottiObsidian-4"
-  "claude-rc-egov|$EGOV|claude --rc --dangerously-skip-permissions --name TottiEgov"
+  "claude-rc-1|$OBS|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 claude --rc --name TottiObsidian-1"
+  "claude-rc-2|$OBS|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 claude --rc --name TottiObsidian-2"
+  "claude-rc-3|$OBS|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 claude --rc --name TottiObsidian-3"
+  "claude-rc-4|$OBS|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 claude --rc --name TottiObsidian-4"
+  "claude-rc-egov|$EGOV|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 claude --rc --dangerously-skip-permissions --name TottiEgov"
 )
 
 WANT=("$@")  # leer = alle
