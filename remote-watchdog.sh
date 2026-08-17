@@ -203,7 +203,9 @@ fi
 # NOTE: the "↯" separator glyph is deliberately NOT a token -- it was present
 # on the 2026-07-17 never-connected sessions too (it means "--rc flag on",
 # not "bridge registered") and would mask exactly that failure again.
-RC_TOKEN_RE='/rc( |$)|remote.control'
+# SICHERHEIT (Audit 16.08.2026, F06): Der Punkt in 'remote.control' traf JEDES Zeichen (auch
+# 'remote control', 'remoteXcontrol'). Auf die tatsaechlichen Schreibweisen verengt: '-', '.', ' '.
+RC_TOKEN_RE='/rc( |$)|remote[-. ]control'
 RC_HEALTHY_RE='active'           # kept for reference; no longer the health test
 RC_DEGRADED_RE='reconnect|connecting'
 # Positive failure signal: a hard 401 / expired login. This is the ONLY "gone"
@@ -225,14 +227,29 @@ NOTIFY_CFG="$HOME/.config/claude-rc-watchdog/notify.env"
 notify_totti() {
   local msg="$1"
   if $DRY_RUN; then echo "[DRY-RUN] Would notify Totti: $msg"; return 0; fi
+  # WARTUNG/ROBUSTHEIT (Audit 16.08.2026, F07): $msg wird als ARGUMENT uebergeben, nie in eine
+  # AppleScript-Quelle oder handgebautes JSON interpoliert. Damit ist die Funktion unabhaengig
+  # davon sicher und robust, was ein Aufrufer hineingibt. Nebenbei behoben: die Byte-Kuerzung
+  # ${safe:0:200} beim Aufrufer konnte unter der C-Locale eine UTF-8-Sequenz zerreissen und das
+  # handgebaute JSON ungueltig machen -- json.dumps kodiert korrekt. Muster aus wm-watch.sh:69-87.
   # Lokale Desktop-Meldung (greift, wenn jemand am Mac sitzt).
-  osascript -e "display notification \"$msg\" with title \"RC-Watchdog\"" >/dev/null 2>&1 || true
+  osascript - "$msg" >/dev/null 2>&1 <<'APPLESCRIPT' || true
+on run argv
+  display notification (item 1 of argv) with title "RC-Watchdog"
+end run
+APPLESCRIPT
   # Push aufs Handy via n8n-Webhook (greift auch unterwegs).
   if [ -n "${RC_NOTIFY_WEBHOOK:-}" ]; then
-    curl -sS -m 15 -o /dev/null -X POST -H 'Content-Type: application/json' \
-      --data "{\"message\":\"$msg\"}" "$RC_NOTIFY_WEBHOOK" >/dev/null 2>&1 \
-      && echo "[NOTIFY] Telegram-Alert gesendet" \
-      || echo "[NOTIFY] Webhook-Push fehlgeschlagen"
+    local payload=""
+    payload=$(python3 -c 'import json,sys; print(json.dumps({"message": sys.argv[1]}))' "$msg" 2>/dev/null) || payload=""
+    if [ -z "$payload" ]; then
+      echo "[NOTIFY] JSON-Kodierung fehlgeschlagen -- kein Push"
+    elif curl -sS -m 15 -o /dev/null -X POST -H 'Content-Type: application/json' \
+           --data "$payload" "$RC_NOTIFY_WEBHOOK" >/dev/null 2>&1; then
+      echo "[NOTIFY] Telegram-Alert gesendet"
+    else
+      echo "[NOTIFY] Webhook-Push fehlgeschlagen"
+    fi
   fi
 }
 
@@ -244,7 +261,7 @@ notify_totti() {
 # KeepAlive=false, so nothing else restarts it either. This preflight closes
 # that gap: if the server is dead OR any expected claude-rc-* session is missing,
 # we (re)launch them all via start-all-rc.sh (which is idempotent).
-EXPECTED_SESSIONS=(claude-rc-1 claude-rc-2 claude-rc-3 claude-rc-4 claude-rc-egov)
+EXPECTED_SESSIONS=(claude-rc-1 claude-rc-2 claude-rc-3 claude-rc-4 claude-rc-egov claude-rc-text)
 START_ALL_SCRIPT="$HOME/remote-control-setup/start-all-rc.sh"
 # Shared lock with the rc-keepalive LaunchAgent (which also resurrects, every
 # ~60s). mkdir is atomic: whoever creates it first does the restart; the other
@@ -657,14 +674,20 @@ while IFS= read -r line; do
   # starten nach einem Server-Crash wieder bei %0 -- ein verwaister
   # .escalated-Marker der alten %0 haette die NEUE Session, die zufaellig %0
   # bekommt, direkt auf Tier-2 (Hard-Restart) eskaliert, ohne dass je Tier 1
-  # lief. Session-Namen sind stabil (claude-rc-1..4, claude-rc-egov).
+  # lief. Session-Namen sind stabil (claude-rc-1..4, claude-rc-egov, claude-rc-text).
   state_file="/tmp/claude-remote-watchdog-${sess_name//[^a-zA-Z0-9]/_}.fail"
   notify_file="/tmp/claude-remote-watchdog-${sess_name//[^a-zA-Z0-9]/_}.notified"
   esc_file="/tmp/claude-remote-watchdog-${sess_name//[^a-zA-Z0-9]/_}.escalated"
   t2_file="/tmp/claude-remote-watchdog-${sess_name//[^a-zA-Z0-9]/_}.t2last"
 
   # Last RC-indicator line = the status bar (earlier matches are scrollback).
-  rc_line=$(echo "$pane_full" | grep -iE -- "$RC_TOKEN_RE" | tail -1 || true)
+  # SICHERHEIT (Audit 16.08.2026, F06): Die Statusleiste ist Claude Codes Fusszeile GANZ UNTEN.
+  # Frueher wurde die letzte RC-Token-Zeile im GANZEN sichtbaren Pane gewertet -- eingeschleuster
+  # GESPRAECHSTEXT (z.B. "die remote-control Bridge ist am reconnecting", ueber WebFetch/Issue/
+  # Notion/Dateiausgabe in die Pane gebracht) konnte so als Statusleiste durchgehen und einen
+  # unbeaufsichtigten C-c + blindes Enter ausloesen. Jetzt nur die untersten nicht-leeren Zeilen.
+  pane_tail=$(echo "$pane_full" | grep -v '^[[:space:]]*$' | tail -6)
+  rc_line=$(echo "$pane_tail" | grep -iE -- "$RC_TOKEN_RE" | tail -1 || true)
 
   # Classification (2026-06-23 rewrite): act ONLY on a positive failure signal.
   # A connected session on Claude Code 2.1.185 may show "/rc" WITHOUT the word
