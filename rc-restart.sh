@@ -16,15 +16,32 @@ set -u
 
 OBS="/Users/romanmathismacmini/TottiObsidian/TottiObsidian"
 EGOV="/Users/romanmathismacmini/Projekte/flowable-egov-apps"
+TEXT="/Users/romanmathismacmini/Projekte/totti-text"
 
 # Session-Definition:  name | arbeitsverzeichnis | claude-startbefehl
 DEFS=(
-  "claude-rc-1|$OBS|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 claude --rc --name TottiObsidian-1"
-  "claude-rc-2|$OBS|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 claude --rc --name TottiObsidian-2"
-  "claude-rc-3|$OBS|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 claude --rc --name TottiObsidian-3"
-  "claude-rc-4|$OBS|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 claude --rc --name TottiObsidian-4"
-  "claude-rc-egov|$EGOV|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 claude --rc --dangerously-skip-permissions --name TottiEgov"
+  "claude-rc-1|$OBS|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 claude --rc --permission-mode bypassPermissions --name TottiObsidian-1"
+  "claude-rc-2|$OBS|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 claude --rc --permission-mode bypassPermissions --name TottiObsidian-2"
+  "claude-rc-3|$OBS|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 claude --rc --permission-mode bypassPermissions --name TottiObsidian-3"
+  "claude-rc-4|$OBS|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 claude --rc --permission-mode bypassPermissions --name TottiObsidian-4"
+  "claude-rc-egov|$EGOV|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 claude --rc --permission-mode bypassPermissions --name TottiEgov"
+  "claude-rc-text|$TEXT|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 claude --rc --permission-mode bypassPermissions --name TottiText"
 )
+
+# --- Arbeitsschutz (13.09.2026) ---------------------------------------------
+# Am 13.09.2026 wurde TottiObsidian-1 mitten in Romans Arbeit neu gestartet
+# (16 Eingaben, Thema Franzoesisch-App). Der Verlauf war per /resume nur am Mac
+# holbar, nicht ueber Remote Control. Seither killt dieses Skript keine Session
+# mehr, in der gearbeitet wurde -- ausser mit --force.
+FORCE=0
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    --force|-f) FORCE=1 ;;
+    *) ARGS+=("$a") ;;
+  esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
 
 WANT=("$@")  # leer = alle
 
@@ -32,6 +49,12 @@ want_it() {
   [ ${#WANT[@]} -eq 0 ] && return 0
   local n
   for n in "${WANT[@]}"; do [ "$n" = "$1" ] && return 0; done
+  return 1
+}
+
+skipped_it() {
+  local n
+  for n in "${SKIPPED[@]+"${SKIPPED[@]}"}"; do [ "$n" = "$1" ] && return 0; done
   return 1
 }
 
@@ -58,6 +81,26 @@ wait_for_bridge() {
   return 1
 }
 
+# Gibt 0 zurueck, wenn in der Session gearbeitet wurde, d.h. wenn es im
+# Scrollback echte Eingaben gibt ausser dem Erkennungs-Text dieses Skripts,
+# oder wenn gerade etwas laeuft. Faehrt fail-safe: laesst sich der Pane nicht
+# lesen, gilt die Session als benutzt.
+session_has_work() {
+  local name="$1" pane
+  pane=$(tmux capture-pane -p -S -3000 -t "$name" 2>/dev/null) || return 0
+  [ -n "$pane" ] || return 0
+  # laeuft gerade etwas?
+  printf '%s\n' "$pane" | grep -qiE "esc to interrupt" && { WORK_REASON="arbeitet gerade"; return 0; }
+  local n
+  n=$(printf '%s\n' "$pane" \
+        | grep -E '^[[:space:]]*❯[[:space:]]+[^[:space:]]' \
+        | grep -vF 'Antworte NUR mit genau dieser einen Zeile' \
+        | grep -vF 'bereit und einsatzbereit' \
+        | wc -l | tr -d ' ')
+  if [ "${n:-0}" -gt 0 ]; then WORK_REASON="$n Eingabe(n) im Verlauf"; return 0; fi
+  return 1
+}
+
 start_one() {
   local name="$1" cwd="$2" cmd="$3"
   tmux kill-session -t "$name" 2>/dev/null
@@ -78,10 +121,19 @@ if [ -n "$CLAUDE_REAL" ] && xattr -p com.apple.quarantine "$CLAUDE_REAL" >/dev/n
   xattr -d com.apple.quarantine "$CLAUDE_REAL" 2>/dev/null || true
 fi
 
+SKIPPED=()
 echo "=== RC-Restart $(date '+%H:%M:%S') · Claude $(claude --version 2>/dev/null) ==="
 for def in "${DEFS[@]}"; do
   IFS='|' read -r name cwd cmd <<< "$def"
   want_it "$name" || continue
+  WORK_REASON=""
+  if [ "$FORCE" -eq 0 ] && session_has_work "$name"; then
+    echo "⛔ $name: ÜBERSPRUNGEN -- ${WORK_REASON:-in dieser Session wurde gearbeitet}."
+    echo "   Erst den Verlauf sichern, dann mit --force neu starten."
+    echo "   Trotzdem neu starten:  $0 $name --force"
+    SKIPPED+=("$name")
+    continue
+  fi
   echo "→ $name: neu starten ($cmd)"
   start_one "$name" "$cwd" "$cmd"
   # Stagger (2026-07-17): 5 gleichzeitige `claude --rc`-Boots + parallele
@@ -96,6 +148,7 @@ FAILED=()
 for def in "${DEFS[@]}"; do
   IFS='|' read -r name cwd cmd <<< "$def"
   want_it "$name" || continue
+  skipped_it "$name" && continue
   if wait_for_bridge "$name"; then
     echo "✓ $name: RC-Bridge steht"
   else
@@ -119,6 +172,7 @@ echo "=== Sende Erkennungs-Text an jede Session ==="
 for def in "${DEFS[@]}"; do
   IFS='|' read -r name cwd cmd <<< "$def"
   want_it "$name" || continue
+  skipped_it "$name" && continue
   disp="${cmd##*--name }"              # z. B. "TottiObsidian-1" / "TottiEgov"
   # Text und Enter GETRENNT senden (mit Pause) -> sonst wird bei langem Text
   # + Emoji das Enter nicht sauber uebernommen und der Prompt bleibt haengen.
@@ -131,6 +185,7 @@ echo "--- Antworten der Sessions ---"
 for def in "${DEFS[@]}"; do
   IFS='|' read -r name cwd cmd <<< "$def"
   want_it "$name" || continue
+  skipped_it "$name" && continue
   # Antwortzeile = die '⏺'-Zeile von Claude (nicht die '❯'-Eingabezeile)
   reply=$(tmux capture-pane -p -t "$name" 2>/dev/null | grep -E '^\s*⏺' | tail -1 | sed 's/^[[:space:]]*//')
   printf "  %-16s %s\n" "$name" "${reply:-(noch keine Antwort - kurz warten)}"
@@ -144,5 +199,8 @@ echo "=== Health-Check ==="
 if (( ${#FAILED[@]} > 0 )); then
   echo "FEHLGESCHLAGEN: ${FAILED[*]} -- Exit 1"
   exit 1
+fi
+if (( ${#SKIPPED[@]} > 0 )); then
+  echo "ÜBERSPRUNGEN (Arbeitsschutz): ${SKIPPED[*]} -- mit --force erzwingen"
 fi
 echo "Fertig. (Hinweis: frischer Start = leere Verlaeufe; alte per /resume holbar.)"

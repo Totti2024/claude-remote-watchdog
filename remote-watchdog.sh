@@ -377,7 +377,11 @@ restart_session_hard() {
     return 1
   fi
   echo "[ACTION] Hard-restarting $sess_name via rc-restart.sh (in-place reconnect already failed once)..."
-  if "$RC_RESTART_SCRIPT" "$sess_name" >/dev/null 2>&1; then
+  # --force (13.09.2026): rc-restart.sh ueberspringt seit heute Sessions, in denen
+  # gearbeitet wurde. Hier ist das falsch -- der Watchdog kommt nur hierher, wenn die
+  # Bridge tot ist und der In-Place-Reconnect schon scheiterte; die Session ist fuer
+  # Roman also ohnehin unerreichbar. Reparatur hat Vorrang, der Verlauf bleibt per /resume.
+  if "$RC_RESTART_SCRIPT" "$sess_name" --force >/dev/null 2>&1; then
     echo "[OK] $sess_name hard-restarted -- RC bridge should establish within seconds"
     notify_totti "RC-Session $sess_name: RC-Bridge kam nach Neustart nie hoch. Watchdog hat automatisch einen Hard-Restart via rc-restart.sh ausgeloest. Alter Verlauf per /resume in der Session holbar."
   else
@@ -648,7 +652,16 @@ if ! tmux list-sessions >/dev/null 2>&1; then
 fi
 missing=()
 for s in "${EXPECTED_SESSIONS[@]}"; do
-  tmux has-session -t "$s" 2>/dev/null || missing+=("$s")
+  if ! tmux has-session -t "$s" 2>/dev/null; then
+    missing+=("$s")
+  # 13.09.2026: Session ohne claude im Startbefehl = kaputter Start, nur eine
+  # leere Shell (Vorfall nach Reboot). Wegraeumen, sonst ueberspringt das
+  # idempotente start-all-rc.sh sie und sie bleibt fuer immer tot.
+  elif ! tmux list-panes -t "$s" -F '#{pane_start_command}' 2>/dev/null | grep -q claude; then
+    echo "[WARN] $s runs without claude (shell only) -- recreating"
+    $DRY_RUN || tmux kill-session -t "$s" 2>/dev/null || true
+    missing+=("$s")
+  fi
 done
 if (( ${#missing[@]} > 0 )); then
   resurrect_server "missing sessions: ${missing[*]}"
