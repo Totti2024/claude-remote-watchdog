@@ -16,6 +16,7 @@ set -u
 
 OBS="/Users/romanmathismacmini/TottiObsidian/TottiObsidian"
 EGOV="/Users/romanmathismacmini/Projekte/flowable-egov-apps"
+EGOV2="/Users/romanmathismacmini/Projekte/flowable-egov-apps-2"  # Git-Worktree, 15.09.2026
 TEXT="/Users/romanmathismacmini/Projekte/totti-text"
 
 # Session-Definition:  name | arbeitsverzeichnis | claude-startbefehl
@@ -25,6 +26,7 @@ DEFS=(
   "claude-rc-3|$OBS|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 claude --rc --permission-mode bypassPermissions --name TottiObsidian-3"
   "claude-rc-4|$OBS|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 claude --rc --permission-mode bypassPermissions --name TottiObsidian-4"
   "claude-rc-egov|$EGOV|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 claude --rc --permission-mode bypassPermissions --name TottiEgov"
+  "claude-rc-egov2|$EGOV2|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 claude --rc --permission-mode bypassPermissions --name TottiEgov-2"
   "claude-rc-text|$TEXT|CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 claude --rc --permission-mode bypassPermissions --name TottiText"
 )
 

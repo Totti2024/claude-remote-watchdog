@@ -261,7 +261,7 @@ APPLESCRIPT
 # KeepAlive=false, so nothing else restarts it either. This preflight closes
 # that gap: if the server is dead OR any expected claude-rc-* session is missing,
 # we (re)launch them all via start-all-rc.sh (which is idempotent).
-EXPECTED_SESSIONS=(claude-rc-1 claude-rc-2 claude-rc-3 claude-rc-4 claude-rc-egov claude-rc-text)
+EXPECTED_SESSIONS=(claude-rc-1 claude-rc-2 claude-rc-3 claude-rc-4 claude-rc-egov claude-rc-egov2 claude-rc-text)
 START_ALL_SCRIPT="$HOME/remote-control-setup/start-all-rc.sh"
 # Shared lock with the rc-keepalive LaunchAgent (which also resurrects, every
 # ~60s). mkdir is atomic: whoever creates it first does the restart; the other
